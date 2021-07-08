@@ -34,6 +34,8 @@ func TestResponseEmptyTransferEncoding(t *testing.T) {
 
 // Don't send the fragment/hash/# part of a URL to the server.
 func TestFragmentInURIRequest(t *testing.T) {
+	t.Parallel()
+
 	var req Request
 	req.SetRequestURI("https://docs.gitlab.com/ee/user/project/integrations/webhooks.html#events")
 
@@ -48,6 +50,8 @@ func TestFragmentInURIRequest(t *testing.T) {
 }
 
 func TestIssue875(t *testing.T) {
+	t.Parallel()
+
 	type testcase struct {
 		uri              string
 		expectedRedirect string
@@ -738,6 +742,23 @@ func TestResponseReadEOF(t *testing.T) {
 	}
 	if err == io.EOF {
 		t.Fatalf("expecting non-EOF error")
+	}
+}
+
+func TestRequestReadNoBody(t *testing.T) {
+	t.Parallel()
+
+	var r Request
+
+	br := bufio.NewReader(bytes.NewBufferString("GET / HTTP/1.1\r\n\r\n"))
+	err := r.Read(br)
+	r.SetHost("foobar")
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+	s := r.String()
+	if strings.Contains(s, "Content-Length: ") {
+		t.Fatalf("unexpected Content-Length")
 	}
 }
 
@@ -2210,9 +2231,9 @@ func TestRequestRawBodyCopyTo(t *testing.T) {
 }
 
 type testReader struct {
-	read chan (int)
-	cb   chan (struct{})
-	onClose func() error 
+	read    chan (int)
+	cb      chan (struct{})
+	onClose func() error
 }
 
 func (r *testReader) Read(b []byte) (int, error) {

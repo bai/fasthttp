@@ -572,6 +572,7 @@ type RequestCtx struct {
 	connID         uint64
 	connRequestNum uint64
 	connTime       time.Time
+	remoteAddr     net.Addr
 
 	time time.Time
 
@@ -690,6 +691,11 @@ func (ctx *RequestCtx) VisitUserValues(visitor func([]byte, interface{})) {
 		kv := &ctx.userValues[i]
 		visitor(kv.key, kv.value)
 	}
+}
+
+// ResetUserValues allows to reset user values from Request Context
+func (ctx *RequestCtx) ResetUserValues() {
+	ctx.userValues.Reset()
 }
 
 type connTLSer interface {
@@ -1091,6 +1097,9 @@ func (ctx *RequestCtx) IsHead() bool {
 //
 // Always returns non-nil result.
 func (ctx *RequestCtx) RemoteAddr() net.Addr {
+	if ctx.remoteAddr != nil {
+		return ctx.remoteAddr
+	}
 	if ctx.c == nil {
 		return zeroTCPAddr
 	}
@@ -1099,6 +1108,14 @@ func (ctx *RequestCtx) RemoteAddr() net.Addr {
 		return zeroTCPAddr
 	}
 	return addr
+}
+
+// SetRemoteAddr sets remote address to the given value.
+//
+// Set nil value to resore default behaviour for using
+// connection remote address.
+func (ctx *RequestCtx) SetRemoteAddr(remoteAddr net.Addr) {
+	ctx.remoteAddr = remoteAddr
 }
 
 // LocalAddr returns server address for the given request.
@@ -1768,7 +1785,7 @@ func (s *Server) Serve(ln net.Listener) error {
 // When Shutdown is called, Serve, ListenAndServe, and ListenAndServeTLS immediately return nil.
 // Make sure the program doesn't exit and waits instead for Shutdown to return.
 //
-// Shutdown does not close keepalive connections so its recommended to set ReadTimeout to something else than 0.
+// Shutdown does not close keepalive connections so its recommended to set ReadTimeout and IdleTimeout to something else than 0.
 func (s *Server) Shutdown() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -2044,7 +2061,7 @@ func (s *Server) serveConn(c net.Conn) (err error) {
 			// within the idle time.
 			if connRequestNum > 1 {
 				var b []byte
-				b, err = br.Peek(4)
+				b, err = br.Peek(1)
 				if len(b) == 0 {
 					// If reading from a keep-alive connection returns nothing it means
 					// the connection was closed (either timeout or from the other side).
@@ -2079,8 +2096,28 @@ func (s *Server) serveConn(c net.Conn) (err error) {
 				ctx.Request.Header.DisableNormalizing()
 				ctx.Response.Header.DisableNormalizing()
 			}
-			// reading Headers
-			if err = ctx.Request.Header.Read(br); err == nil {
+
+			// Reading Headers.
+			//
+			// If we have pipline response in the outgoing buffer,
+			// we only want to try and read the next headers once.
+			// If we have to wait for the next request we flush the
+			// outgoing buffer first so it doesn't have to wait.
+			if bw != nil && bw.Buffered() > 0 {
+				err = ctx.Request.Header.readLoop(br, false)
+				if err == errNeedMore {
+					err = bw.Flush()
+					if err != nil {
+						break
+					}
+
+					err = ctx.Request.Header.Read(br)
+				}
+			} else {
+				err = ctx.Request.Header.Read(br)
+			}
+
+			if err == nil {
 				if onHdrRecv := s.HeaderReceived; onHdrRecv != nil {
 					reqConf := onHdrRecv(&ctx.Request.Header)
 					if reqConf.ReadTimeout > 0 {
@@ -2225,8 +2262,6 @@ func (s *Server) serveConn(c net.Conn) (err error) {
 		hijackNoResponse = ctx.hijackNoResponse && hijackHandler != nil
 		ctx.hijackNoResponse = false
 
-		ctx.userValues.Reset()
-
 		if s.MaxRequestsPerConn > 0 && connRequestNum >= uint64(s.MaxRequestsPerConn) {
 			ctx.SetConnectionClose()
 		}
@@ -2317,6 +2352,7 @@ func (s *Server) serveConn(c net.Conn) (err error) {
 		}
 
 		s.setState(c, StateIdle)
+		ctx.userValues.Reset()
 
 		if atomic.LoadInt32(&s.stop) == 1 {
 			err = nil
@@ -2524,6 +2560,7 @@ func (s *Server) acquireCtx(c net.Conn) (ctx *RequestCtx) {
 // See https://github.com/valyala/httpteleport for details.
 func (ctx *RequestCtx) Init2(conn net.Conn, logger Logger, reduceMemoryUsage bool) {
 	ctx.c = conn
+	ctx.remoteAddr = nil
 	ctx.logger.logger = logger
 	ctx.connID = nextConnID()
 	ctx.s = fakeServer
@@ -2636,7 +2673,9 @@ func (s *Server) releaseCtx(ctx *RequestCtx) {
 		panic("BUG: cannot release timed out RequestCtx")
 	}
 	ctx.c = nil
+	ctx.remoteAddr = nil
 	ctx.fbr.c = nil
+	ctx.userValues.Reset()
 	s.ctxPool.Put(ctx)
 }
 
